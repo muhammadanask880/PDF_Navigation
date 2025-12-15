@@ -246,7 +246,7 @@ const pendingSheetID = "{normalized_sheet_id}";
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
  
 let pdfDoc = null;
-let scale = 1.0;
+let scale = 0.25;
 let currentPage = 1;
 const pagesDiv = document.getElementById('pages');
 const breadcrumbDiv = document.getElementById('breadcrumb');
@@ -446,3 +446,4 @@ document.getElementById('scaleInput').oninput = (e) => {{
 """
  
 st.components.v1.html(html, height=800, scrolling=True)
+
