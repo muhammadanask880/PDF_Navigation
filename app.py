@@ -6,13 +6,8 @@ import json
 import re
  
 # ---------------- Streamlit Config ----------------
-st.set_page_config(page_title="Zoomable PDF Viewer", layout="wide")
+st.set_page_config(page_title="Smart PDF Navigator", layout="wide")
 st.title("Sheet Navigator")
- 
-# ---------------- Session State for History ----------------
-# List of {sheet: str, page: int}
-if 'nav_history' not in st.session_state:
-    st.session_state.nav_history = []  
  
 # ---------------- Load PDF ----------------
 uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
@@ -25,7 +20,7 @@ elif os.path.exists("sample.pdf"):
         with open("sample.pdf", "rb") as f:
             pdf_bytes = f.read()
     except FileNotFoundError:
-        pass # Allow the st.info message below to run
+        pass
  
 if pdf_bytes is None:
     st.info("Upload a PDF or place sample.pdf next to this app")
@@ -41,7 +36,7 @@ def extract_sheet_map(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     sheet_map = {}
     
-    # Regex matches: S-6, A-201, S-6.0, FX001, FX-002, etc.
+    # Regex matches: S-6, A-201, S-6.0, FX001, etc.
     pattern = re.compile(r"\b(?:[A-Z]{1,4}-?\d+(?:\.\d+)?|[A-Z]{2,5}\d{1,4})\b")
  
     for page_index, page in enumerate(doc):
@@ -56,7 +51,7 @@ def extract_sheet_map(pdf_bytes):
                 for span in line.get("spans", []):
                     raw = span.get("text", "").strip()
                     size = span.get("size", 0)
-                    x0, y0, x1, y1 = span.get("bbox", (0, 0, 0, 0))
+                    _, y0, _, _ = span.get("bbox", (0, 0, 0, 0))
                     
                     # Only consider bottom 20% of page
                     if y0 < height * 0.80:
@@ -76,53 +71,39 @@ def extract_sheet_map(pdf_bytes):
             
     return sheet_map
  
-# Extract all sections first
 with st.spinner("Extracting sections from PDF..."):
     sheet_map = extract_sheet_map(pdf_bytes)
  
-# ---------------- Sidebar Input & History Update Logic ----------------
-normalized_sheet_id = "" # Default to empty
- 
-def reset_history():
-    """Clears the breadcrumb history."""
-    st.session_state.nav_history = []
-    
-# Use a key to prevent re-running the input and causing a history loop
-input_key = "sheet_input_field"
+# ---------------- Sidebar Logic ----------------
+# We communicate via "Commands" to the JS frontend.
+target_sheet_id = ""
+target_page_num = 0
  
 with st.sidebar:
     st.markdown("### Sheet/Section Navigation")
     st.markdown(f"**Total Sections:** {len(sheet_map)}")
     
-    # User Input
-    sheet_input = st.text_input("Enter Sheet/Section ID (e.g., S-6, S-6.0)", key=input_key)
+    # Input field
+    sheet_input = st.text_input("Enter Sheet/Section ID (e.g., S-6)", key="sheet_input_field")
     
-    if st.button("Reset Breadcrumbs"):
-        reset_history()
-        # Rerun to update the history in the component
-        st.rerun()
+    # Reset Button sends a specific flag to JS to clear local storage
+    if st.button("Reset History"):
+        target_sheet_id = "RESET"
  
-    # 1. Validation Logic
+    # Process Input
     if sheet_input:
         key = sheet_input.strip().upper()
-        # Normalization logic
+        # Normalize S-6 to S-6.0
         if re.match(r"^[A-Z]{1,4}-\d+$", key):
             key += ".0"
             
         if key in sheet_map:
-            normalized_sheet_id = key
-            page_num = sheet_map[key]
-            
-            # 2. History Management (Append New Entry)
-            last_entry = st.session_state.nav_history[-1] if st.session_state.nav_history else None
-            
-            # Append only if it's a new, valid sheet ID
-            if last_entry is None or last_entry['sheet'] != normalized_sheet_id:
-                st.session_state.nav_history.append({"sheet": normalized_sheet_id, "page": page_num})
-                
+            target_sheet_id = key
+            target_page_num = sheet_map[key]
         else:
-            st.error(f"Sheet '{sheet_input}' not found in extracted data.")
+            st.error(f"Sheet '{sheet_input}' not found.")
  
+    st.divider()
     st.caption("Detected sections (auto-extracted):")
     if sheet_map:
         st.code(", ".join(sorted(sheet_map.keys())))
@@ -132,102 +113,83 @@ with st.sidebar:
 # ---------------- Prepare Data for JS ----------------
 b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
 sheet_map_json = json.dumps(sheet_map)
-history_json = json.dumps(st.session_state.nav_history)
  
 # ---------------- HTML + JS Viewer ----------------
-html = f"""
+html_code = f"""
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>PDF Viewer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
 <style>
-  /* Reset and Basic Setup */
+  /* --- STYLES --- */
   body, html {{ margin:0; padding: 0; height: 100vh; overflow: hidden; font-family: sans-serif; background: #525659; }}
   
   .container {{
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
-    width: 100%;
+    display: flex; flex-direction: column; height: 100vh; width: 100%;
   }}
   
-  /* Breadcrumb & Toolbar Styles */
+  /* Header UI */
   .header-ui {{
-    background: #f9fafb;
-    border-bottom: 1px solid #ccc;
-    flex-shrink: 0;
+    background: #f9fafb; border-bottom: 1px solid #ccc; flex-shrink: 0; padding: 8px 16px;
+    display: flex; gap: 15px; align-items: center; justify-content: space-between;
   }}
  
+  /* Breadcrumb Area */
   .breadcrumb {{
-    padding: 8px 16px;
-    display:flex;
-    align-items:center;
-    gap:8px;
-    flex-wrap:wrap;
-    border-bottom: 1px solid #eee;
+    display:flex; align-items:center; gap:6px; flex-wrap:wrap; flex: 1;
   }}
   
   .breadcrumb-item {{
-    padding: 4px 10px;
-    background:#fff;
-    border:1px solid #d1d5db;
-    border-radius:4px;
-    cursor:pointer;
-    font-size:13px;
-    white-space: nowrap; /* Prevent sheet IDs from wrapping */
+    padding: 4px 10px; background:#fff; border:1px solid #d1d5db; border-radius:4px;
+    cursor:pointer; font-size:13px; white-space: nowrap; user-select: none;
   }}
   .breadcrumb-item:hover {{ background:#e0e7ff; }}
   .breadcrumb-item.active {{ background:#4f46e5; color:#fff; border-color:#4f46e5; }}
   .breadcrumb-separator {{ color:#9ca3af; font-weight:bold; font-size: 12px; }}
  
-  .toolbar {{
-    padding: 8px 16px;
-    display:flex;
-    gap:10px;
-    align-items:center;
-    background: white;
-  }}
- 
-  /* VIEWER CONTAINER - The Scrollable Area */
+  /* Controls */
+  .controls {{ display: flex; gap: 10px; align-items: center; }}
+  
+  /* Viewer Area */
   .viewer {{
-      flex: 1;
-      overflow: auto; /* Enable Scrollbars for X and Y */
-      padding: 20px;
-      position: relative;
-      background-color: #525659;
-  }}
- 
-  /* PAGE CARD - Holds the Canvas */
-  .page-card {{
-      background: white;
-      box-shadow: 0 4px 8px rgba(0,0,0,0.3);
-      margin: 0 auto 20px auto;
-      
-      width: fit-content;
-      max-width: none;
-      display: block;
+      flex: 1; overflow: auto; padding: 20px; position: relative; background-color: #525659;
+      display: block; /* Changed from flex to block for better scroll handling */
   }}
   
-  canvas {{ display: block; }}
+  /* Custom Scrollbar Styling */
+  .viewer::-webkit-scrollbar {{
+    width: 10px;
+    height: 10px;
+  }}
+  .viewer::-webkit-scrollbar-track {{
+    background: transparent;
+  }}
+  .viewer::-webkit-scrollbar-thumb {{
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 5px;
+  }}
+  .viewer::-webkit-scrollbar-thumb:hover {{
+    background: rgba(255, 255, 255, 0.4);
+  }}
+ 
+  canvas {{
+      display: block; margin: 0 auto 20px auto; /* Center horizontally safely */
+      box-shadow: 0 4px 8px rgba(0,0,0,0.3); background: white;
+  }}
 </style>
 </head>
 <body>
  
 <div class="container">
-  
   <div class="header-ui">
     <div class="breadcrumb" id="breadcrumb"></div>
- 
-    <div class="toolbar">
-      <label>Page:</label>
-      <input type="number" id="pageInput" min="1" value="1" style="width:50px;">
-      <button id="goBtn">Go</button>
-      <button id="backBtn">← Back</button>
-      <div style="flex:1"></div>
-      <label>Zoom:</label>
-      <input type="range" id="scaleInput" min="0.25" max="4.0" step="0.25" value="0.25">
-      <span id="scaleDisplay">0.25×</span>
+    
+    <div class="controls">
+        <span style="font-size: 12px; font-weight: bold; color: #555;">Current Page: <span id="pg-disp">1</span></span>
+        <label style="font-size: 12px; color: #555;">Zoom:</label>
+        <input type="range" id="scaleInput" min="0.5" max="3.0" step="0.5" value="1.0" style="width: 80px;">
     </div>
   </div>
  
@@ -236,214 +198,232 @@ html = f"""
   </div>
 </div>
  
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
 <script>
-const pdfBytes = Uint8Array.from(atob("{b64_pdf}"), c => c.charCodeAt(0));
-const sheetMap = {sheet_map_json};
-let navigationHistory = {history_json}; // Use the history passed from Python
-const pendingSheetID = "{normalized_sheet_id}";
+// --- PYTHON DATA BRIDGE ---
+const pdfData = "{b64_pdf}";
+// If user typed "S-5", this will be "S-5.0". Otherwise empty string.
+const pendingSheetID = "{target_sheet_id}";
+// If user typed "S-5", this will be the page number (e.g. 8). Otherwise 0.
+const pendingPage = {target_page_num};
+ 
+// --- CONSTANTS ---
+const KEY_HISTORY = 'pdf_nav_history_v2';
+const KEY_LAST_PAGE = 'pdf_last_viewed_page_v2';
  
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
  
 let pdfDoc = null;
-let scale = 0.25;
-let currentPage = 1;
-const pagesDiv = document.getElementById('pages');
-const breadcrumbDiv = document.getElementById('breadcrumb');
-const viewerDiv = document.getElementById('viewer');
+let scale = 1.0;
+let navHistory = [];
  
+// =========================================================
+// 1. HISTORY & NAVIGATION LOGIC
+// =========================================================
  
-// Function to inform Streamlit to update its session state (used for history manipulation)
-function updateStreamlitHistory(history, newPage) {{
-    // Post the new history state back to Streamlit
-    const newHistoryJson = JSON.stringify(history);
-    
-    // This is a minimal way to send data back to Streamlit
-    // We send a JSON stringified object containing the new history and the page to jump to
-    // Streamlit doesn't natively handle two-way communication easily, so we use a trick:
-    // We update the local history here, but to persist it, Streamlit needs to re-render.
-    // For this demonstration, we'll keep the history manipulation local in JS
-    // and rely on Streamlit's full re-run only when the Python input changes.
-    // The breadcrumb logic is purely visual here, based on the initial state.
+// Load history from SessionStorage (survives Python re-runs)
+try {{
+    navHistory = JSON.parse(sessionStorage.getItem(KEY_HISTORY) || '[]');
+}} catch(e) {{ navHistory = []; }}
+ 
+// Handle RESET command
+if (pendingSheetID === "RESET") {{
+    navHistory = [];
+    sessionStorage.removeItem(KEY_HISTORY);
+    sessionStorage.removeItem(KEY_LAST_PAGE);
 }}
  
-// 1. Setup Breadcrumbs
+// Determine where we were BEFORE this reload
+// Default to 1 if no history
+let lastViewedPage = parseInt(sessionStorage.getItem(KEY_LAST_PAGE) || '1');
+ 
+// === CRITICAL FIX: Update History based on Python Input ===
+if (pendingPage > 0 && pendingSheetID !== "RESET") {{
+    
+    // Check if this is a repeat command (e.g. user refreshed browser)
+    const lastEntry = navHistory.length > 0 ? navHistory[navHistory.length - 1] : null;
+    
+    // Only update history if the destination is different from the current top entry
+    // OR if history is empty
+    if (!lastEntry || (lastEntry.sheet !== pendingSheetID)) {{
+        
+        // A. Add "FROM" Page (Where we scrolled to manually)
+        // Check if we are actually moving away from a different page
+        // AND ensure the last entry isn't already the page we are on
+        if (!lastEntry || lastEntry.page !== lastViewedPage) {{
+             navHistory.push({{ sheet: "Page " + lastViewedPage, page: lastViewedPage }});
+        }}
+ 
+        // B. Add "TO" Page (The target from Python)
+        navHistory.push({{ sheet: pendingSheetID, page: pendingPage }});
+        
+        // C. Save & Update
+        sessionStorage.setItem(KEY_HISTORY, JSON.stringify(navHistory));
+        
+        // Update current position immediately to avoid jitter
+        lastViewedPage = pendingPage;
+        sessionStorage.setItem(KEY_LAST_PAGE, pendingPage);
+    }}
+}}
+ 
+// =========================================================
+// 2. UI RENDERING
+// =========================================================
+ 
 function renderBreadcrumb() {{
-    breadcrumbDiv.innerHTML = '';
-    if (navigationHistory.length === 0) {{
-        let item = document.createElement('div');
-        item.className = 'breadcrumb-item active';
-        item.innerText = 'Start';
-        breadcrumbDiv.appendChild(item);
-        return;
+    const bc = document.getElementById('breadcrumb');
+    bc.innerHTML = '';
+ 
+    if (navHistory.length === 0) {{
+         bc.innerHTML = '<div class="breadcrumb-item active">Start</div>';
+         return;
     }}
  
-    navigationHistory.forEach((entry, idx) => {{
+    navHistory.forEach((item, idx) => {{
         if (idx > 0) {{
             let sep = document.createElement('span');
             sep.className = 'breadcrumb-separator';
             sep.innerText = '→';
-            breadcrumbDiv.appendChild(sep);
+            bc.appendChild(sep);
         }}
         
-        let item = document.createElement('div');
-        const isActive = (idx === navigationHistory.length - 1 && entry.page === currentPage);
-        item.className = 'breadcrumb-item' + (isActive ? ' active' : '');
-        item.innerText = entry.sheet || `Page ${{entry.page}}`;
+        let el = document.createElement('div');
+        el.className = 'breadcrumb-item';
+        if (idx === navHistory.length - 1 && item.page === lastViewedPage) {{
+            el.classList.add('active');
+        }}
         
-        // --- Breadcrumb Trimming Logic ---
-        item.onclick = () => {{
-            // 1. Trim the history array up to and including the clicked index
-            navigationHistory = navigationHistory.slice(0, idx + 1);
+        el.innerText = item.sheet;
+        
+        // Click to navigate back
+        el.onclick = () => {{
+            // Trim history forward of this point
+            navHistory = navHistory.slice(0, idx + 1);
+            sessionStorage.setItem(KEY_HISTORY, JSON.stringify(navHistory));
             
-            // 2. Navigate to the page
-            gotoPage(entry.page);
-            
-            // 3. Re-render breadcrumb to show the new, trimmed state
+            // Go to that page
+            scrollToPage(item.page);
             renderBreadcrumb();
         }};
         
-        breadcrumbDiv.appendChild(item);
+        bc.appendChild(el);
     }});
 }}
  
-// 2. Create Empty Page Containers
-function createPages(numPages) {{
-    pagesDiv.innerHTML = '';
-    for(let i=1; i<=numPages; i++) {{
-        let card = document.createElement('div');
-        card.className = 'page-card';
-        card.id = 'page-card-' + i;
-        
+// =========================================================
+// 3. PDF RENDERING & SCROLLING
+// =========================================================
+ 
+async function loadDocument() {{
+    const pdfBytes = Uint8Array.from(atob(pdfData), c => c.charCodeAt(0));
+    pdfDoc = await pdfjsLib.getDocument({{ data: pdfBytes }}).promise;
+    
+    const pagesContainer = document.getElementById('pages');
+    
+    // Render all pages
+    for(let i=1; i<=pdfDoc.numPages; i++) {{
         let canvas = document.createElement('canvas');
         canvas.id = 'canvas-' + i;
-        canvas.dataset.page = i;
         
-        card.appendChild(canvas);
-        pagesDiv.appendChild(card);
+        // Initial render logic
+        // We use a simple strategy: render visible pages later for performance,
+        // but for this demo, we render all sequentially or on demand.
+        // Here we create the structure first.
+        pagesContainer.appendChild(canvas);
+        renderPage(i);
     }}
+ 
+    // Jump to the calculated start page
+    // (Either the target from Python OR the last remembered scroll position)
+    setTimeout(() => {{
+        scrollToPage(lastViewedPage);
+    }}, 500); // Small delay to allow rendering to settle
 }}
  
-// 3. Render a Single Page (Fixes Rotation Issue)
-function renderPage(n) {{
-    if(!pdfDoc) return Promise.resolve();
-    return pdfDoc.getPage(n).then(p => {{
-        let v = p.getViewport({{scale}});
-        let c = document.getElementById('canvas-' + n);
-        let ctx = c.getContext('2d');
-        
-        let dpr = window.devicePixelRatio || 1;
-        c.width = v.width * dpr;
-        c.height = v.height * dpr;
-        
-        // CSS dimensions control the visible size (Crucial for horizontal scroll)
-        c.style.width = v.width + 'px';
-        c.style.height = v.height + 'px';
-        
-        // Ensure standard transform matrix (no rotation or skewing)
-        return p.render({{
-            canvasContext: ctx,
-            viewport: v,
-            transform: [dpr, 0, 0, dpr, 0, 0] // dpr scaling, no rotation
-        }}).promise;
-    }});
+async function renderPage(num) {{
+    const page = await pdfDoc.getPage(num);
+    const viewport = page.getViewport({{ scale: scale }});
+    const canvas = document.getElementById('canvas-' + num);
+    const context = canvas.getContext('2d');
+ 
+    canvas.height = viewport.height;
+    canvas.width = viewport.width;
+    
+    // Adjust CSS width for zoom effect
+    canvas.style.width = viewport.width + "px";
+    canvas.style.height = viewport.height + "px";
+ 
+    await page.render({{ canvasContext: context, viewport: viewport }}).promise;
 }}
  
-// 4. Scroll Logic
 function scrollToPage(p) {{
-    const card = document.getElementById('page-card-' + p);
-    if(card) {{
-        card.scrollIntoView({{block: 'start', inline: 'nearest', behavior: 'auto'}});
-        
-        // Minor adjustment for top toolbar
-        if(viewerDiv.scrollTop > 0) viewerDiv.scrollTop -= 10;
- 
-        currentPage = p;
-        document.getElementById('pageInput').value = p;
-        
-        // Ensure breadcrumb active state is correct after jump
-        renderBreadcrumb();
+    const canvas = document.getElementById('canvas-' + p);
+    if(canvas) {{
+        canvas.scrollIntoView({{block: 'start', inline: 'nearest', behavior: 'auto'}});
+        updateScrollState(p);
     }}
 }}
  
-// 5. Smart Loading Sequence
-async function loadDocument() {{
-    pdfDoc = await pdfjsLib.getDocument({{data: pdfBytes}}).promise;
-    createPages(pdfDoc.numPages);
-    
-    let targetPage = 1;
-    // Prioritize the latest history entry
-    if (navigationHistory.length > 0) {{
-        targetPage = navigationHistory[navigationHistory.length - 1].page;
-    }} else if (pendingSheetID && sheetMap[pendingSheetID]) {{
-        // Fallback for first run with a direct input
-        targetPage = sheetMap[pendingSheetID];
-    }}
+// =========================================================
+// 4. SCROLL DETECTION (The Magic Part)
+// =========================================================
  
-    // Render target page immediately
-    await renderPage(targetPage);
-    scrollToPage(targetPage);
-    
-    // Render rest in background
+let scrollTimeout;
+document.getElementById('viewer').addEventListener('scroll', () => {{
+    clearTimeout(scrollTimeout);
+    // Debounce to avoid constant updates
+    scrollTimeout = setTimeout(() => {{
+        detectCurrentPage();
+    }}, 150);
+}});
+ 
+function detectCurrentPage() {{
+    const viewer = document.getElementById('viewer');
+    const viewerRect = viewer.getBoundingClientRect();
+    const midPoint = viewerRect.top + (viewerRect.height / 3); // Check near top third
+ 
+    // Loop through canvases to find which one is visible
     for(let i=1; i<=pdfDoc.numPages; i++) {{
-        if(i !== targetPage) {{
-            setTimeout(() => {{ renderPage(i); }}, 0);
+        const canvas = document.getElementById('canvas-' + i);
+        const rect = canvas.getBoundingClientRect();
+        
+        // If the top of the page is within the viewer or just above it
+        // (Simple visibility check)
+        if (rect.top <= midPoint && rect.bottom >= midPoint) {{
+            if (lastViewedPage !== i) {{
+                updateScrollState(i);
+            }}
+            break;
         }}
     }}
 }}
  
-function gotoPage(p) {{
-    if(p < 1 || p > pdfDoc.numPages) return;
-    scrollToPage(p);
+function updateScrollState(p) {{
+    lastViewedPage = p;
+    document.getElementById('pg-disp').innerText = p;
+    // Save to session immediately so Python reload knows where we were
+    sessionStorage.setItem(KEY_LAST_PAGE, p);
+    
+    // Optional: Update breadcrumb active state visually if matches
+    renderBreadcrumb();
 }}
  
-// Initialization
-renderBreadcrumb();
-loadDocument();
- 
-// Event Listeners
-document.getElementById('goBtn').onclick = () => {{
-    const p = parseInt(document.getElementById('pageInput').value);
-    if (p >= 1 && p <= pdfDoc.numPages) {{
-        // Note: We don't update navigationHistory here because this button
-        // is for scrolling, not formal sheet navigation. History is handled by
-        // sidebar input or breadcrumb clicks.
-        gotoPage(p);
-    }}
-}};
- 
-document.getElementById('backBtn').onclick = () => {{
-    if(navigationHistory.length > 1) {{
-        // Remove the current (last) entry
-        navigationHistory.pop();
-        
-        // Get the new last entry
-        const lastEntry = navigationHistory[navigationHistory.length - 1];
-        
-        // Go back to the previous page
-        gotoPage(lastEntry.page);
-        
-        // Update breadcrumb
-        renderBreadcrumb();
-    }}
-}};
- 
+// Zoom Logic
 document.getElementById('scaleInput').oninput = (e) => {{
     scale = parseFloat(e.target.value);
-    document.getElementById('scaleDisplay').innerText = scale.toFixed(2) + '×';
-    
-    // Update all pages with new scale
-    renderPage(currentPage).then(() => {{
-         for(let i=1; i<=pdfDoc.numPages; i++) {{
-             if(i !== currentPage) renderPage(i);
-         }}
-    }});
+    // Re-render all pages (simple approach)
+    // In production, you might only re-render visible ones
+    for(let i=1; i<=pdfDoc.numPages; i++) {{
+        renderPage(i);
+    }}
 }};
+ 
+// Init
+renderBreadcrumb();
+loadDocument();
  
 </script>
 </body>
 </html>
 """
  
-st.components.v1.html(html, height=800, scrolling=True)
-
+st.components.v1.html(html_code, height=800)
